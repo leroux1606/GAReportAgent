@@ -138,7 +138,7 @@ class GA4DataManager:
     
     def get_data_with_retry(self, dimensions: List[str], metrics: List[str], 
                            start_date: str, end_date: str, limit: int = 10000) -> Dict:
-        """Enhanced data retrieval with retry logic and rate limiting"""
+        """Enhanced data retrieval with retry logic, rate limiting, and pagination"""
         max_retries = 3
         
         for attempt in range(max_retries):
@@ -162,29 +162,22 @@ class GA4DataManager:
                         "compatibility_info": validation_result.get("compatibility_info")
                     }
                 
-                # Build and execute request
-                request = RunReportRequest(
-                    property=f"properties/{self.property_id}",
-                    date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
-                    dimensions=[Dimension(name=dim) for dim in dimensions],
-                    metrics=[Metric(name=metric) for metric in metrics],
-                    limit=min(limit, 100000)  # GA4 API limit
-                )
-                
-                response = self.client.run_report(request)
-                
-                # Process response
-                data = self._process_response(response, dimensions, metrics)
+                # Get all data with pagination
+                all_data = self._get_all_data_paginated(dimensions, metrics, start_date, end_date, limit)
                 
                 return {
                     "success": True,
-                    "data": data,
-                    "row_count": len(data),
+                    "data": all_data["data"],
+                    "row_count": all_data["total_rows"],
+                    "pages_fetched": all_data["pages_fetched"],
                     "metadata": {
                         "dimensions": dimensions,
                         "metrics": metrics,
                         "date_range": f"{start_date} to {end_date}",
-                        "property_id": self.property_id
+                        "property_id": self.property_id,
+                        "total_rows": all_data["total_rows"],
+                        "pages_fetched": all_data["pages_fetched"],
+                        "data_complete": all_data["data_complete"]
                     }
                 }
                 
@@ -198,6 +191,106 @@ class GA4DataManager:
                     }
                 
         return {"success": False, "error": "Max retries exceeded"}
+    
+    def _get_all_data_paginated(self, dimensions: List[str], metrics: List[str], 
+                               start_date: str, end_date: str, requested_limit: int) -> Dict:
+        """Retrieve all data using pagination to bypass 100k row limit"""
+        all_data = []
+        offset = 0
+        page_size = 100000  # GA4 API maximum per request
+        pages_fetched = 0
+        total_rows = 0
+        
+        logger.info(f"Starting paginated data retrieval for {len(dimensions)} dimensions, {len(metrics)} metrics")
+        logger.info(f"Date range: {start_date} to {end_date}")
+        
+        while True:
+            try:
+                # Build request with offset for pagination
+                request = RunReportRequest(
+                    property=f"properties/{self.property_id}",
+                    date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+                    dimensions=[Dimension(name=dim) for dim in dimensions],
+                    metrics=[Metric(name=metric) for metric in metrics],
+                    limit=page_size,
+                    offset=offset
+                )
+                
+                logger.info(f"Fetching page {pages_fetched + 1}, offset: {offset}, limit: {page_size}")
+                
+                # Execute request
+                response = self.client.run_report(request)
+                
+                # Check if we got any data
+                if not response.rows:
+                    logger.info(f"No more data available. Stopping pagination.")
+                    break
+                
+                # Process this page of data
+                page_data = self._process_response(response, dimensions, metrics)
+                page_row_count = len(page_data)
+                
+                logger.info(f"Page {pages_fetched + 1}: Retrieved {page_row_count} rows")
+                
+                # Add to combined data
+                all_data.extend(page_data)
+                total_rows += page_row_count
+                pages_fetched += 1
+                
+                # Check if we've reached the user's requested limit
+                if requested_limit > 0 and total_rows >= requested_limit:
+                    logger.info(f"Reached requested limit of {requested_limit} rows. Stopping.")
+                    all_data = all_data[:requested_limit]  # Trim to exact limit
+                    total_rows = len(all_data)
+                    break
+                
+                # Check if this was a partial page (less than page_size)
+                # This indicates we've reached the end of available data
+                if page_row_count < page_size:
+                    logger.info(f"Received partial page ({page_row_count} < {page_size}). All data retrieved.")
+                    break
+                
+                # Prepare for next page
+                offset += page_size
+                
+                # Safety limit: prevent infinite loops
+                if pages_fetched >= 50:  # Max 5 million rows (50 * 100k)
+                    logger.warning(f"Reached maximum page limit of {pages_fetched} pages. Stopping.")
+                    break
+                
+                # Rate limiting between pages
+                time.sleep(0.1)  # Small delay between requests
+                
+            except Exception as e:
+                logger.error(f"Error during pagination at offset {offset}: {str(e)}")
+                if pages_fetched == 0:
+                    # If we failed on the first page, raise the error
+                    raise e
+                else:
+                    # If we got some data, return what we have
+                    logger.warning(f"Pagination failed after {pages_fetched} pages. Returning partial data.")
+                    break
+        
+        # Log final summary
+        logger.info(f"Pagination complete: {total_rows} total rows across {pages_fetched} pages")
+        
+        # Calculate summary statistics for logging
+        if all_data:
+            sample_data = all_data[:5]  # First 5 rows for debugging
+            logger.info(f"Sample data (first 5 rows): {sample_data}")
+            
+            # Log metric totals for verification
+            for metric in metrics:
+                if metric in all_data[0]:  # Check if metric exists in data
+                    total_metric = sum(float(row.get(metric, 0)) for row in all_data)
+                    logger.info(f"Total {metric}: {total_metric:,.0f}")
+        
+        return {
+            "data": all_data,
+            "total_rows": total_rows,
+            "pages_fetched": pages_fetched,
+            "data_complete": pages_fetched < 50  # True if we didn't hit safety limit
+        }
     
     def _validate_query_inputs(self, dimensions: List[str], metrics: List[str], 
                               start_date: str, end_date: str) -> Dict:
@@ -379,8 +472,8 @@ class RobustQueryIntelligence:
         "temporal": ["date", "dateHour", "hour", "month", "week", "year"],
         
         # User dimensions  
-        "user": ["userType", "newVsReturning", "cohort", "userAgeBracket", "userGender"],
-        "demographic": ["userAgeBracket", "userGender", "userType"],
+        "user": ["newVsReturning", "userAgeBracket", "userGender"],
+        "demographic": ["userAgeBracket", "userGender", "newVsReturning"],
         
         # Geography dimensions
         "location": ["country", "region", "city", "continent", "subContinent"],
@@ -478,14 +571,14 @@ class RobustQueryIntelligence:
         "screenPageViews": {
             "incompatible_dimensions": [
                 # User-scoped dimensions (definitely incompatible)
-                "userType", "newVsReturning", "userAgeBracket", "userGender", 
+                "newVsReturning", "userAgeBracket", "userGender", 
                 "cohort", "userFirstTouchTimestamp"
             ],
             "reason": "User-scoped dimensions are incompatible with page-scoped metrics like screenPageViews"
         },
         "screenPageViewsPerSession": {
             "incompatible_dimensions": [
-                "userType", "newVsReturning", "userAgeBracket", "userGender",
+                "newVsReturning", "userAgeBracket", "userGender",
                 "cohort"
             ],
             "reason": "User-scoped dimensions are incompatible with session-scoped page metrics"
@@ -501,7 +594,7 @@ class RobustQueryIntelligence:
         # Event metrics with incompatible dimensions
         "eventCount": {
             "incompatible_dimensions": [
-                "userType", "newVsReturning", "userAgeBracket", "userGender"
+                "newVsReturning", "userAgeBracket", "userGender"
             ],
             "reason": "User-scoped dimensions often incompatible with event-scoped metrics"
         },
@@ -536,6 +629,7 @@ class RobustQueryIntelligence:
         "totalRevenue": 1.0,  # Prefer total revenue
         "purchaseRevenue": 0.8,
         "transactionRevenue": 0.6,
+        "conversions": 0.9,  # High priority for conversion metrics
         
         "eventCount": 1.0,  # Prefer total event count
         "eventsPerSession": 0.8,
@@ -583,13 +677,37 @@ class RobustQueryIntelligence:
             "keywords": ["conversion", "goal", "revenue", "sales", "purchase", "transaction", "money"],
             "priority": 1.3,
             "default_dimensions": ["date"],
-            "default_metrics": ["conversions", "totalRevenue", "transactions"]
+            "default_metrics": ["conversions", "totalRevenue", "transactions", "sessions", "screenPageViews"]
         },
         "ecommerce_analysis": {
             "keywords": ["product", "item", "cart", "checkout", "purchase", "ecommerce", "shop"],
             "priority": 1.2,
             "default_dimensions": ["itemName", "itemCategory"],
             "default_metrics": ["itemsPurchased", "itemRevenue", "itemsAddedToCart"]
+        },
+        "valuable_users_analysis": {
+            "keywords": ["valuable", "value", "high-value", "profitable", "quality", "best", "top countries", "top cities"],
+            "priority": 1.4,
+            "default_dimensions": ["country"],
+            "default_metrics": ["totalRevenue", "sessions", "totalUsers", "conversions"]
+        },
+        "valuable_users_city_analysis": {
+            "keywords": ["valuable", "value", "cities", "city", "high-value", "profitable", "quality", "best cities", "top cities"],
+            "priority": 1.5,
+            "default_dimensions": ["city"],
+            "default_metrics": ["totalRevenue", "sessions", "totalUsers", "conversions"]
+        },
+        "city_usage_analysis": {
+            "keywords": ["cities", "city", "usage", "total usage", "city traffic", "city sessions", "city users"],
+            "priority": 1.6,
+            "default_dimensions": ["city"],
+            "default_metrics": ["sessions", "totalUsers", "screenPageViews"]
+        },
+        "top_products_analysis": {
+            "keywords": ["products", "product", "top products", "product performance", "best products", "selling products", "product pages"],
+            "priority": 1.7,
+            "default_dimensions": ["pagePath", "pageTitle"],
+            "default_metrics": ["screenPageViews", "sessions", "totalUsers"]
         }
     }
     
@@ -978,6 +1096,32 @@ class ProfessionalVisualizer:
         df = pd.DataFrame(data)
         summary_parts = []
         
+        # Enhanced logging for debugging calculation issues
+        logger.info(f"=== EXECUTIVE SUMMARY DEBUG INFO ===")
+        logger.info(f"Query type: {query_type}")
+        logger.info(f"Data rows received: {len(data)}")
+        logger.info(f"Data columns: {df.columns.tolist()}")
+        logger.info(f"Sample data (first 3 rows): {data[:3]}")
+        
+        # Log metrics totals for verification against GA
+        if 'sessions' in df.columns:
+            total_sessions = df['sessions'].sum()
+            logger.info(f"TOTAL SESSIONS IN DATA: {total_sessions:,.0f}")
+            
+            # If this is traffic source analysis, show breakdown by source
+            if 'source' in df.columns:
+                source_breakdown = df.groupby('source')['sessions'].sum().sort_values(ascending=False)
+                logger.info(f"SESSIONS BY SOURCE:")
+                for source, sessions in source_breakdown.head(10).items():
+                    logger.info(f"  {source}: {sessions:,.0f}")
+        
+        if 'totalUsers' in df.columns:
+            total_users = df['totalUsers'].sum()
+            logger.info(f"TOTAL USERS IN DATA: {total_users:,.0f}")
+        
+        logger.info(f"=== END DEBUG INFO ===")
+        
+        
         # Time period analysis
         if 'date' in df.columns:
             date_range = f"{df['date'].min()} to {df['date'].max()}"
@@ -1028,6 +1172,24 @@ class ProfessionalVisualizer:
             if 'pagePath' in df.columns:
                 unique_pages = df['pagePath'].nunique()
                 summary_parts.append(f"**Pages Analyzed**: {unique_pages:,}")
+        
+        elif query_type == "top_products":
+            if 'pagePath' in df.columns:
+                # Filter for product pages and add product-specific summary
+                product_pages = df[df['pagePath'].str.contains('/product/', case=False, na=False)]
+                if not product_pages.empty:
+                    summary_parts.append(f"**Product Pages Found**: {len(product_pages):,}")
+                    
+                    # Add product-specific metrics if available
+                    if 'screenPageViews' in product_pages.columns:
+                        total_product_views = product_pages['screenPageViews'].sum()
+                        summary_parts.append(f"**Total Product Views**: {total_product_views:,}")
+                    
+                    if 'sessions' in product_pages.columns:
+                        total_product_sessions = product_pages['sessions'].sum()
+                        summary_parts.append(f"**Product Sessions**: {total_product_sessions:,}")
+                else:
+                    summary_parts.append("**Product Pages Found**: 0 (No '/product/' URLs detected)")
         
         if not summary_parts:
             return f"**Executive Summary**: Data retrieved for {query_type} analysis but specific metrics are not available or contain zero values."
@@ -1478,10 +1640,26 @@ class ProfessionalVisualizer:
                 friendly_labels.append(f'{flag} {label.title()}')
             
             elif dimension_type == 'pagePath':
-                # Show the FULL page path for complete clarity
+                # Enhanced page path handling with product-specific formatting
                 path = str(label)
                 if path in ['/', '', '/index.html', '/home']:
                     friendly_labels.append('🏠 Homepage')
+                elif '/product/' in path.lower():
+                    # Special handling for product pages
+                    product_name = path.split('/product/')[-1] if '/product/' in path else path
+                    # Clean up product name
+                    product_name = product_name.replace('/', '').replace('-', ' ').replace('_', ' ')
+                    # Remove query parameters
+                    if '?' in product_name:
+                        product_name = product_name.split('?')[0]
+                    # Capitalize and truncate if needed
+                    if product_name:
+                        product_name = product_name.title()
+                        if len(product_name) > 40:
+                            product_name = product_name[:37] + '...'
+                        friendly_labels.append(f'🛍️ {product_name}')
+                    else:
+                        friendly_labels.append(f'🛍️ Product Page')
                 else:
                     # Show the complete path - no truncation, maximum clarity
                     friendly_labels.append(f'📄 {path}')
@@ -1612,13 +1790,13 @@ class ReportGenerator:
             logger.info(f"Query config: {query_config}")
             logger.info(f"Date range: {date_range}")
             
-            # Get data
+            # Get data - using 0 for unlimited to retrieve all data via pagination
             data_result = self.ga_manager.get_data_with_retry(
                 dimensions=query_config['dimensions'],
                 metrics=query_config['metrics'],
                 start_date=date_range[0],
                 end_date=date_range[1],
-                limit=10000
+                limit=0  # 0 = unlimited, will fetch all available data
             )
             
             if not data_result['success']:
@@ -1816,14 +1994,43 @@ class ReportGenerator:
                 insights.append(f"💰 Total product revenue: ${total_revenue:,.2f}")
         
         elif query_type == "conversion":
-            # Conversion analysis insights
-            if 'conversions' in df.columns:
+            # Conversion analysis insights with robust fallback handling
+            conversion_data_found = False
+            
+            if 'conversions' in df.columns and df['conversions'].sum() > 0:
                 total_conversions = df['conversions'].sum()
                 insights.append(f"🎯 Total conversions: {total_conversions:,}")
+                conversion_data_found = True
                 
-                if 'totalRevenue' in df.columns and total_conversions > 0:
-                    avg_order_value = df['totalRevenue'].sum() / total_conversions
+                if 'totalRevenue' in df.columns and df['totalRevenue'].sum() > 0:
+                    total_revenue = df['totalRevenue'].sum()
+                    avg_order_value = total_revenue / total_conversions
+                    insights.append(f"💵 Total revenue: ${total_revenue:,.2f}")
                     insights.append(f"💵 Average order value: ${avg_order_value:.2f}")
+            
+            if 'transactions' in df.columns and df['transactions'].sum() > 0:
+                total_transactions = df['transactions'].sum()
+                insights.append(f"🛒 Total transactions: {total_transactions:,}")
+                conversion_data_found = True
+            
+            # If no conversion data found, provide helpful feedback
+            if not conversion_data_found:
+                insights.append("💡 **Conversion data not available** - This may be because:")
+                insights.append("   • Conversion/goal tracking is not set up in GA4")
+                insights.append("   • No conversions occurred in the selected time period")
+                insights.append("   • Ecommerce tracking is not enabled")
+                
+                # Provide fallback traffic insights if available
+                if 'sessions' in df.columns:
+                    total_sessions = df['sessions'].sum()
+                    insights.append(f"📊 Showing traffic data instead: {total_sessions:,} sessions")
+                    
+                    if 'screenPageViews' in df.columns:
+                        total_pageviews = df['screenPageViews'].sum()
+                        pages_per_session = total_pageviews / total_sessions if total_sessions > 0 else 0
+                        insights.append(f"📄 Pages per session: {pages_per_session:.1f}")
+                
+                insights.append("💡 **Tip**: Set up conversion tracking in GA4 to see conversion performance data.")
         
         elif query_type == "source":
             # Traffic source insights (alias for acquisition)
@@ -1844,6 +2051,135 @@ class ReportGenerator:
                 for device, sessions in device_breakdown.head(3).items():
                     percentage = (sessions / total_sessions) * 100
                     insights.append(f"📱 {device.title()}: {percentage:.1f}% of sessions")
+        
+        elif query_type == "top_products":
+            # Top products analysis insights - filter for product pages
+            if 'pagePath' in df.columns:
+                # Filter for product pages (URLs containing '/product/')
+                product_pages = df[df['pagePath'].str.contains('/product/', case=False, na=False)]
+                
+                if not product_pages.empty:
+                    # Use the most relevant metric available
+                    metric_col = 'screenPageViews' if 'screenPageViews' in product_pages.columns else 'sessions'
+                    metric_name = "page views" if metric_col == 'screenPageViews' else "sessions"
+                    
+                    # Top performing product
+                    top_product = product_pages.loc[product_pages[metric_col].idxmax()]
+                    product_name = top_product['pageTitle'] if 'pageTitle' in product_pages.columns and pd.notna(top_product['pageTitle']) else top_product['pagePath']
+                    insights.append(f"🏆 Top performing product: {product_name} ({top_product[metric_col]:,} {metric_name})")
+                    
+                    # Total product metrics
+                    total_product_metric = product_pages[metric_col].sum()
+                    total_metric = df[metric_col].sum() if metric_col in df.columns else total_product_metric
+                    product_percentage = (total_product_metric / total_metric) * 100 if total_metric > 0 else 0
+                    insights.append(f"📦 Product pages: {len(product_pages)} pages with {total_product_metric:,} total {metric_name} ({product_percentage:.1f}% of all traffic)")
+                    
+                    # Top 3 products performance
+                    if len(product_pages) >= 3:
+                        top_3_metric = product_pages.nlargest(3, metric_col)[metric_col].sum()
+                        top_3_percentage = (top_3_metric / total_product_metric) * 100
+                        insights.append(f"🎯 Top 3 products account for {top_3_percentage:.1f}% of product {metric_name}")
+                    
+                    # Product engagement analysis
+                    if 'sessions' in product_pages.columns and 'totalUsers' in product_pages.columns:
+                        avg_sessions_per_user = product_pages['sessions'].sum() / product_pages['totalUsers'].sum() if product_pages['totalUsers'].sum() > 0 else 0
+                        insights.append(f"🔄 Average sessions per user on product pages: {avg_sessions_per_user:.2f}")
+                    
+                    # Product page efficiency
+                    if 'screenPageViews' in product_pages.columns and 'sessions' in product_pages.columns:
+                        avg_pages_per_session = product_pages['screenPageViews'].sum() / product_pages['sessions'].sum() if product_pages['sessions'].sum() > 0 else 0
+                        insights.append(f"📄 Average page views per session on products: {avg_pages_per_session:.2f}")
+                    
+                else:
+                    insights.append("📦 No product pages found with '/product/' in URL")
+                    insights.append("💡 Check if your product URLs follow the '/product/' pattern")
+            else:
+                insights.append("📦 Product analysis requires page path data")
+        
+        elif query_type in ["valuable_users", "valuable_users_city", "city_usage"]:
+            # Valuable users and city usage analysis insights
+            geo_dimension = 'country' if 'country' in df.columns else 'city'
+            
+            if geo_dimension in df.columns:
+                # For city usage analysis, prioritize usage metrics over revenue
+                if query_type == "city_usage" and 'sessions' in df.columns:
+                    # Usage-focused analysis for cities
+                    total_sessions = df['sessions'].sum()
+                    top_geo = df.loc[df['sessions'].idxmax()]
+                    top_session_percentage = (top_geo['sessions'] / total_sessions) * 100
+                    insights.append(f"🏙️ Highest usage city: {top_geo[geo_dimension]} ({top_geo['sessions']:,.0f} sessions - {top_session_percentage:.1f}% of total)")
+                    
+                    # Users analysis
+                    if 'totalUsers' in df.columns:
+                        total_users = df['totalUsers'].sum()
+                        top_user_geo = df.loc[df['totalUsers'].idxmax()]
+                        top_user_percentage = (top_user_geo['totalUsers'] / total_users) * 100
+                        insights.append(f"👥 Most users from: {top_user_geo[geo_dimension]} ({top_user_geo['totalUsers']:,.0f} users - {top_user_percentage:.1f}%)")
+                        
+                        # Sessions per user (engagement indicator)
+                        if top_geo['totalUsers'] > 0:
+                            sessions_per_user = top_geo['sessions'] / top_geo['totalUsers']
+                            insights.append(f"🔄 Sessions per user from {top_geo[geo_dimension]}: {sessions_per_user:.2f}")
+                    
+                    # Page views analysis if available
+                    if 'screenPageViews' in df.columns:
+                        total_pageviews = df['screenPageViews'].sum()
+                        top_pv_geo = df.loc[df['screenPageViews'].idxmax()]
+                        top_pv_percentage = (top_pv_geo['screenPageViews'] / total_pageviews) * 100
+                        insights.append(f"📄 Most page views from: {top_pv_geo[geo_dimension]} ({top_pv_geo['screenPageViews']:,.0f} views - {top_pv_percentage:.1f}%)")
+                    
+                    # Top 3 cities by usage
+                    if len(df) >= 3:
+                        top_3_sessions = df.nlargest(3, 'sessions')['sessions'].sum()
+                        top_3_percentage = (top_3_sessions / total_sessions) * 100
+                        insights.append(f"🎯 Top 3 cities account for {top_3_percentage:.1f}% of total usage")
+                
+                # Revenue analysis by geography (for valuable users)
+                elif 'totalRevenue' in df.columns and df['totalRevenue'].sum() > 0:
+                    total_revenue = df['totalRevenue'].sum()
+                    top_geo = df.loc[df['totalRevenue'].idxmax()]
+                    top_revenue_percentage = (top_geo['totalRevenue'] / total_revenue) * 100
+                    insights.append(f"💰 Highest revenue {geo_dimension}: {top_geo[geo_dimension]} (${top_geo['totalRevenue']:,.2f} - {top_revenue_percentage:.1f}% of total)")
+                    
+                    # Revenue per user analysis
+                    if 'totalUsers' in df.columns and top_geo['totalUsers'] > 0:
+                        revenue_per_user = top_geo['totalRevenue'] / top_geo['totalUsers']
+                        insights.append(f"💎 Average revenue per user from {top_geo[geo_dimension]}: ${revenue_per_user:.2f}")
+                    
+                    # Top 3 revenue locations
+                    if len(df) >= 3:
+                        top_3_revenue = df.nlargest(3, 'totalRevenue')['totalRevenue'].sum()
+                        top_3_percentage = (top_3_revenue / total_revenue) * 100
+                        insights.append(f"🎯 Top 3 {geo_dimension}s generate {top_3_percentage:.1f}% of total revenue")
+                
+                # Conversion analysis by geography
+                elif 'conversions' in df.columns and df['conversions'].sum() > 0:
+                    total_conversions = df['conversions'].sum()
+                    top_geo = df.loc[df['conversions'].idxmax()]
+                    top_conversion_percentage = (top_geo['conversions'] / total_conversions) * 100
+                    insights.append(f"🎯 Most conversions from: {top_geo[geo_dimension]} ({top_geo['conversions']:,.0f} conversions - {top_conversion_percentage:.1f}%)")
+                    
+                    # Conversion rate analysis
+                    if 'sessions' in df.columns and top_geo['sessions'] > 0:
+                        conversion_rate = (top_geo['conversions'] / top_geo['sessions']) * 100
+                        insights.append(f"📈 Conversion rate from {top_geo[geo_dimension]}: {conversion_rate:.2f}%")
+                
+                # Fallback to sessions analysis for valuable users
+                elif 'sessions' in df.columns:
+                    total_sessions = df['sessions'].sum()
+                    top_geo = df.loc[df['sessions'].idxmax()]
+                    top_session_percentage = (top_geo['sessions'] / total_sessions) * 100
+                    insights.append(f"🌍 Most engaged {geo_dimension}: {top_geo[geo_dimension]} ({top_geo['sessions']:,.0f} sessions - {top_session_percentage:.1f}%)")
+                    
+                    # Users per session (engagement indicator)
+                    if 'totalUsers' in df.columns and top_geo['totalUsers'] > 0:
+                        sessions_per_user = top_geo['sessions'] / top_geo['totalUsers']
+                        insights.append(f"🔄 Sessions per user from {top_geo[geo_dimension]}: {sessions_per_user:.2f}")
+                
+                # Geographic distribution insights
+                unique_locations = df[geo_dimension].nunique()
+                geo_type = "countries" if geo_dimension == "country" else "cities"
+                insights.append(f"🗺️ Analysis covers {unique_locations} different {geo_type}")
         
         # If no insights were generated for any query type, provide a generic message
         if not insights:
@@ -1915,6 +2251,118 @@ class ReportGenerator:
                 if 'country' in df.columns and 'sessions' in df.columns:
                     fig = self.visualizer.create_modern_comparison_chart(df, 'country', 'sessions', 'Geographic Distribution')
                     visualizations.append({"type": "geographic_distribution", "figure": fig})
+            
+            elif query_config['type'] == "conversion":
+                # Handle conversion queries more robustly
+                conversion_metrics = ['conversions', 'transactions', 'totalRevenue']
+                available_conversion_metrics = [m for m in conversion_metrics if m in df.columns and df[m].sum() > 0]
+                
+                if available_conversion_metrics and 'date' in df.columns:
+                    # Create time-series chart for conversion metrics
+                    fig = self.visualizer.create_traffic_chart(df)
+                    visualizations.append({"type": "conversion_trends", "figure": fig})
+                elif 'date' in df.columns:
+                    # Fallback: No conversion data available, show traffic trends with conversion context
+                    if 'sessions' in df.columns:
+                        fig = self.visualizer.create_traffic_chart(df)
+                        # Update title to indicate this is fallback data
+                        fig.update_layout(title="🔍 Website Performance (No Conversion Data Available)")
+                        visualizations.append({"type": "conversion_fallback", "figure": fig})
+                else:
+                    # Non-temporal conversion analysis
+                    dimensions = [col for col in df.columns if col not in conversion_metrics + ['date', 'sessions', 'totalUsers']]
+                    if available_conversion_metrics and dimensions:
+                        fig = self.visualizer.create_modern_comparison_chart(
+                            df, dimensions[0], available_conversion_metrics[0], 
+                            f'💰 Conversion Performance by {dimensions[0].replace("_", " ").title()}'
+                        )
+                        visualizations.append({"type": "conversion_comparison", "figure": fig})
+                    elif 'sessions' in df.columns and dimensions:
+                        # Fallback to sessions data with conversion context
+                        fig = self.visualizer.create_modern_comparison_chart(
+                            df, dimensions[0], 'sessions', 
+                            f'🔍 Traffic Analysis (Conversion Metrics Not Available)'
+                        )
+                        visualizations.append({"type": "conversion_fallback", "figure": fig})
+            
+            elif query_config['type'] == "top_products":
+                # Top products analysis visualization - filter for product pages
+                if 'pagePath' in df.columns:
+                    # Filter for product pages (URLs containing '/product/')
+                    product_pages = df[df['pagePath'].str.contains('/product/', case=False, na=False)]
+                    
+                    if not product_pages.empty:
+                        # Use the most relevant metric available
+                        metric_col = 'screenPageViews' if 'screenPageViews' in product_pages.columns else 'sessions'
+                        metric_name = "Page Views" if metric_col == 'screenPageViews' else "Sessions"
+                        
+                        fig = self.visualizer.create_modern_comparison_chart(
+                            product_pages, 'pagePath', metric_col, 
+                            f'🏆 Top Products by {metric_name}'
+                        )
+                        visualizations.append({"type": "top_products", "figure": fig})
+                    else:
+                        # No product pages found - show message
+                        import plotly.graph_objects as go
+                        fig = go.Figure()
+                        fig.add_annotation(
+                            text="No product pages found with '/product/' in URL<br>Check if your product URLs follow the '/product/' pattern",
+                            xref="paper", yref="paper",
+                            x=0.5, y=0.5, xanchor='center', yanchor='middle',
+                            showarrow=False,
+                            font=dict(size=16, color="#6b7280")
+                        )
+                        fig.update_layout(
+                            title="📦 Top Products Analysis",
+                            xaxis=dict(visible=False),
+                            yaxis=dict(visible=False),
+                            height=400,
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)'
+                        )
+                        visualizations.append({"type": "top_products_empty", "figure": fig})
+            
+            elif query_config['type'] in ["valuable_users", "valuable_users_city", "city_usage"]:
+                # Valuable users and city usage analysis visualization
+                geo_dimension = 'country' if 'country' in df.columns else 'city'
+                geo_type = "Countries" if geo_dimension == 'country' else "Cities"
+                
+                if geo_dimension in df.columns:
+                    # For city usage analysis, prioritize usage metrics
+                    if query_config['type'] == "city_usage":
+                        if 'sessions' in df.columns:
+                            fig = self.visualizer.create_modern_comparison_chart(
+                                df, geo_dimension, 'sessions', 
+                                f'🏙️ Total Sessions by {geo_type}'
+                            )
+                            visualizations.append({"type": "city_usage_sessions", "figure": fig})
+                        elif 'totalUsers' in df.columns:
+                            fig = self.visualizer.create_modern_comparison_chart(
+                                df, geo_dimension, 'totalUsers', 
+                                f'👥 Total Users by {geo_type}'
+                            )
+                            visualizations.append({"type": "city_usage_users", "figure": fig})
+                    else:
+                        # Prefer revenue metrics for valuable users analysis
+                        if 'totalRevenue' in df.columns and df['totalRevenue'].sum() > 0:
+                            fig = self.visualizer.create_modern_comparison_chart(
+                                df, geo_dimension, 'totalRevenue', 
+                                f'💰 Highest Revenue {geo_type}'
+                            )
+                            visualizations.append({"type": "valuable_users_revenue", "figure": fig})
+                        elif 'conversions' in df.columns and df['conversions'].sum() > 0:
+                            fig = self.visualizer.create_modern_comparison_chart(
+                                df, geo_dimension, 'conversions', 
+                                f'🎯 Most Converting {geo_type}'
+                            )
+                            visualizations.append({"type": "valuable_users_conversions", "figure": fig})
+                        elif 'sessions' in df.columns:
+                            # Fallback to sessions for valuable users
+                            fig = self.visualizer.create_modern_comparison_chart(
+                                df, geo_dimension, 'sessions', 
+                                f'🌍 Most Engaged {geo_type}'
+                            )
+                            visualizations.append({"type": "valuable_users_engagement", "figure": fig})
         
         # Fallback: Create best available visualization
         if not visualizations and not df.empty:
@@ -2253,7 +2701,10 @@ def main():
             
             # Advanced queries
             "Which countries bring the most valuable users?",
-            "Show me product performance by category",
+            "Show me total usage by city",
+            "Which cities have the highest traffic?",
+            "Show me top products performance",
+            "Analyze best selling products",
             "Compare bounce rates across different devices",
             "What's my revenue trend over the past quarter?", 
             "Which campaigns are driving the most conversions?",
@@ -2362,7 +2813,7 @@ def main():
             st.markdown('<div class="insight-box">📊 No specific insights available - this may indicate limited data for the selected metrics and time period.</div>', unsafe_allow_html=True)
         
         # Display Visualizations
-            st.markdown("## Charts & Analysis")
+        st.markdown("## Charts & Analysis")
         if report.get("visualizations"):
             for viz in report["visualizations"]:
                 st.plotly_chart(viz["figure"], use_container_width=True)
@@ -2370,7 +2821,7 @@ def main():
             st.markdown('<div class="insight-box">📈 No charts available - insufficient data for visualization. Try adjusting your query or time period.</div>', unsafe_allow_html=True)
         
         # Data Export Section
-            st.markdown("## Data Export")
+        st.markdown("## Data Export")
         if report.get("data") and len(report["data"]) > 0:
             col1, col2, col3 = st.columns(3)
             
@@ -2466,7 +2917,7 @@ def test_ga4_compatibility():
     print("Testing GA4 compatibility system...")
     
     # Test dimension-metric conflict resolution
-    dimensions = ["userType", "pagePath"]  # Should conflict with screenPageViews
+    dimensions = ["newVsReturning", "pagePath"]  # Should conflict with screenPageViews
     metrics = ["screenPageViews", "sessions"]
     
     resolved_dims, resolved_metrics = RobustQueryIntelligence._resolve_dimension_metric_conflicts(dimensions, metrics)
@@ -2476,8 +2927,8 @@ def test_ga4_compatibility():
     print(f"Resolved dimensions: {resolved_dims}")
     print(f"Resolved metrics: {resolved_metrics}")
     
-    # Should have removed userType but kept pagePath
-    assert "userType" not in resolved_dims, "Should have removed userType dimension"
+    # Should have removed newVsReturning but kept pagePath
+    assert "newVsReturning" not in resolved_dims, "Should have removed newVsReturning dimension"
     assert "pagePath" in resolved_dims, "Should have kept pagePath dimension"
     assert "screenPageViews" in resolved_metrics, "Should have kept screenPageViews metric"
     
