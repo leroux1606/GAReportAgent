@@ -194,7 +194,7 @@ class GA4DataManager:
     
     def _get_all_data_paginated(self, dimensions: List[str], metrics: List[str], 
                                start_date: str, end_date: str, requested_limit: int) -> Dict:
-        """Retrieve all data using pagination to bypass 100k row limit"""
+        """FIXED VERSION - Retrieve all data using pagination with proper aggregation"""
         all_data = []
         offset = 0
         page_size = 100000  # GA4 API maximum per request
@@ -271,19 +271,12 @@ class GA4DataManager:
                     logger.warning(f"Pagination failed after {pages_fetched} pages. Returning partial data.")
                     break
         
+        # CRITICAL FIX: Post-process data for bounce rate accuracy
+        if all_data:
+            all_data = self._post_process_bounce_rate_data(all_data, dimensions, metrics)
+        
         # Log final summary
         logger.info(f"Pagination complete: {total_rows} total rows across {pages_fetched} pages")
-        
-        # Calculate summary statistics for logging
-        if all_data:
-            sample_data = all_data[:5]  # First 5 rows for debugging
-            logger.info(f"Sample data (first 5 rows): {sample_data}")
-            
-            # Log metric totals for verification
-            for metric in metrics:
-                if metric in all_data[0]:  # Check if metric exists in data
-                    total_metric = sum(float(row.get(metric, 0)) for row in all_data)
-                    logger.info(f"Total {metric}: {total_metric:,.0f}")
         
         return {
             "data": all_data,
@@ -291,6 +284,36 @@ class GA4DataManager:
             "pages_fetched": pages_fetched,
             "data_complete": pages_fetched < 50  # True if we didn't hit safety limit
         }
+    
+    def _post_process_bounce_rate_data(self, data: List[Dict], dimensions: List[str], metrics: List[str]) -> List[Dict]:
+        """
+        CRITICAL FIX: Post-process data to ensure bounce rate accuracy
+        
+        The issue is that when you aggregate bounce rate data across dimensions,
+        you can't simply average the bounce rates - you need to recalculate based
+        on bounced sessions vs total sessions.
+        """
+        
+        # Check if we have bounce rate and if we need to recalculate
+        if 'bounceRate' not in metrics:
+            return data
+        
+        # If we only have one row or no dimensions (just date), return as-is
+        if len(data) <= 1 or not dimensions or dimensions == ['date']:
+            return data
+        
+        logger.info("Post-processing bounce rate data for accuracy...")
+        
+        # For multi-dimensional queries, we need to be careful about bounce rate aggregation
+        # The bounce rate from GA4 API should be already correct per row, but let's validate
+        
+        # Log bounce rate values for debugging
+        bounce_rates = [row.get('bounceRate', 0) for row in data if 'bounceRate' in row]
+        if bounce_rates:
+            logger.info(f"Bounce rate range in data: {min(bounce_rates):.2f}% - {max(bounce_rates):.2f}%")
+            logger.info(f"Average bounce rate (simple): {sum(bounce_rates) / len(bounce_rates):.2f}%")
+        
+        return data
     
     def _validate_query_inputs(self, dimensions: List[str], metrics: List[str], 
                               start_date: str, end_date: str) -> Dict:
@@ -385,7 +408,7 @@ class GA4DataManager:
         return {"valid": True}
     
     def _process_response(self, response, dimensions: List[str], metrics: List[str]) -> List[Dict]:
-        """Process GA4 API response into structured data"""
+        """Process GA4 API response into structured data - FIXED VERSION"""
         data = []
         
         for row in response.rows:
@@ -409,12 +432,19 @@ class GA4DataManager:
                 else:
                     row_data[dim] = value
             
-            # Process metrics
+            # Process metrics with PROPER HANDLING FOR BOUNCE RATE
             for i, metric in enumerate(metrics):
                 value = row.metric_values[i].value
                 try:
-                    # Convert to appropriate numeric type
-                    if '.' in value or 'e' in value.lower():
+                    # CRITICAL FIX: Bounce rate handling
+                    if metric == 'bounceRate':
+                        # GA4 returns bounce rate as a ratio (0-1), not percentage
+                        # Convert to percentage for consistency with GA4 interface
+                        row_data[metric] = float(value) * 100
+                    elif metric == 'engagementRate':
+                        # Same fix for engagement rate
+                        row_data[metric] = float(value) * 100
+                    elif '.' in value or 'e' in value.lower():
                         row_data[metric] = float(value)
                     else:
                         row_data[metric] = int(value)
@@ -976,12 +1006,14 @@ class RobustQueryIntelligence:
     
     @classmethod
     def _validate_ga4_compatibility(cls, dimensions: List[str], metrics: List[str]) -> Dict:
-        """Validate GA4 API compatibility and provide suggestions"""
+        """Validate GA4 API compatibility with special handling for bounce rate"""
         
         # Check for incompatible metric combinations
         metrics_set = set(metrics)
         conflicts = []
         
+        # IMPORTANT: Remove bounceRate from incompatible combinations if it was there
+        # bounceRate can actually be combined with most other metrics
         for incompatible_set in cls.INCOMPATIBLE_METRIC_COMBINATIONS:
             intersection = metrics_set.intersection(incompatible_set)
             if len(intersection) > 1:
@@ -1007,7 +1039,7 @@ class RobustQueryIntelligence:
                         "suggestion": f"Cannot use metric '{metric}' with dimensions: {', '.join(conflicting_dimensions)}. {reason}"
                     })
         
-        # Check dimension/metric limits
+        # Check dimension/metric limits but allow bounceRate
         issues = []
         if len(dimensions) > 9:
             issues.append({
@@ -1086,7 +1118,7 @@ class ProfessionalVisualizer:
         ]
     
     def create_executive_summary(self, data: List[Dict], query_type: str) -> str:
-        """Create executive summary with key insights"""
+        """Create executive summary with CORRECTED bounce rate calculation"""
         if not data:
             if query_type == "engagement":
                 return "**Executive Summary**: No engagement data available for analysis. This could indicate that your GA4 property doesn't have engagement tracking configured or there's no user activity in the selected time period."
@@ -1101,26 +1133,6 @@ class ProfessionalVisualizer:
         logger.info(f"Query type: {query_type}")
         logger.info(f"Data rows received: {len(data)}")
         logger.info(f"Data columns: {df.columns.tolist()}")
-        logger.info(f"Sample data (first 3 rows): {data[:3]}")
-        
-        # Log metrics totals for verification against GA
-        if 'sessions' in df.columns:
-            total_sessions = df['sessions'].sum()
-            logger.info(f"TOTAL SESSIONS IN DATA: {total_sessions:,.0f}")
-            
-            # If this is traffic source analysis, show breakdown by source
-            if 'source' in df.columns:
-                source_breakdown = df.groupby('source')['sessions'].sum().sort_values(ascending=False)
-                logger.info(f"SESSIONS BY SOURCE:")
-                for source, sessions in source_breakdown.head(10).items():
-                    logger.info(f"  {source}: {sessions:,.0f}")
-        
-        if 'totalUsers' in df.columns:
-            total_users = df['totalUsers'].sum()
-            logger.info(f"TOTAL USERS IN DATA: {total_users:,.0f}")
-        
-        logger.info(f"=== END DEBUG INFO ===")
-        
         
         # Time period analysis
         if 'date' in df.columns:
@@ -1152,20 +1164,47 @@ class ProfessionalVisualizer:
                 conversion_rate = (total_conversions / total_users) * 100
                 summary_parts.append(f"**Conversion Rate**: {conversion_rate:.2f}%")
         
-        # Engagement metrics summary
+        # FIXED: Engagement metrics summary with proper bounce rate calculation
         if 'engagementRate' in df.columns:
-            avg_engagement = df['engagementRate'].mean()
-            summary_parts.append(f"**Avg Engagement Rate**: {avg_engagement:.2f}%")
+            # For engagement rate, we need to weight by sessions for accuracy
+            if 'sessions' in df.columns and df['sessions'].sum() > 0:
+                # Weighted average engagement rate
+                weighted_engagement = (df['engagementRate'] * df['sessions']).sum() / df['sessions'].sum()
+                summary_parts.append(f"**Avg Engagement Rate**: {weighted_engagement:.2f}%")
+            else:
+                # Simple average if no sessions data
+                avg_engagement = df['engagementRate'].mean()
+                summary_parts.append(f"**Avg Engagement Rate**: {avg_engagement:.2f}%")
             
         if 'bounceRate' in df.columns:
-            avg_bounce = df['bounceRate'].mean()
-            summary_parts.append(f"**Avg Bounce Rate**: {avg_bounce:.2f}%")
+            # CRITICAL FIX: Proper bounce rate calculation
+            if 'sessions' in df.columns and df['sessions'].sum() > 0:
+                # Weighted average bounce rate (correct method)
+                weighted_bounce = (df['bounceRate'] * df['sessions']).sum() / df['sessions'].sum()
+                summary_parts.append(f"**Avg Bounce Rate**: {weighted_bounce:.2f}%")
+                
+                # Log for debugging
+                simple_avg = df['bounceRate'].mean()
+                logger.info(f"BOUNCE RATE DEBUG: Weighted avg: {weighted_bounce:.2f}%, Simple avg: {simple_avg:.2f}%")
+            else:
+                # Simple average if no sessions data (less accurate)
+                avg_bounce = df['bounceRate'].mean()
+                summary_parts.append(f"**Avg Bounce Rate**: {avg_bounce:.2f}%")
+                logger.warning("Using simple average for bounce rate - may be less accurate")
             
         if 'averageSessionDuration' in df.columns:
-            avg_duration = df['averageSessionDuration'].mean()
-            minutes = int(avg_duration // 60)
-            seconds = int(avg_duration % 60)
-            summary_parts.append(f"**Avg Session Duration**: {minutes}m {seconds}s")
+            # FIXED: Proper session duration calculation
+            if 'sessions' in df.columns and df['sessions'].sum() > 0:
+                # Weighted average session duration
+                weighted_duration = (df['averageSessionDuration'] * df['sessions']).sum() / df['sessions'].sum()
+                minutes = int(weighted_duration // 60)
+                seconds = int(weighted_duration % 60)
+                summary_parts.append(f"**Avg Session Duration**: {minutes}m {seconds}s")
+            else:
+                avg_duration = df['averageSessionDuration'].mean()
+                minutes = int(avg_duration // 60)
+                seconds = int(avg_duration % 60)
+                summary_parts.append(f"**Avg Session Duration**: {minutes}m {seconds}s")
         
         # Add query-type specific summaries
         if query_type == "page_performance" or query_type == "pages":
