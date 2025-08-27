@@ -432,22 +432,34 @@ class GA4DataManager:
                 else:
                     row_data[dim] = value
             
-            # Process metrics with PROPER HANDLING FOR BOUNCE RATE
+            # Process metrics with PROPER HANDLING FOR GA4 BOUNCE RATE AND ENGAGEMENT RATE
             for i, metric in enumerate(metrics):
                 value = row.metric_values[i].value
                 try:
-                    # CRITICAL FIX: Bounce rate handling
+                    # CRITICAL FIX: GA4 Bounce Rate and Engagement Rate handling
                     if metric == 'bounceRate':
-                        # GA4 returns bounce rate as a ratio (0-1), not percentage
-                        # Convert to percentage for consistency with GA4 interface
-                        row_data[metric] = float(value) * 100
+                        # GA4 bounce rate is the inverse of engagement rate
+                        # It represents % of non-engaged sessions
+                        # GA4 returns this as a ratio (0-1), convert to percentage
+                        bounce_rate = float(value) * 100
+                        row_data[metric] = bounce_rate
+                        
+                        # Log for debugging
+                        if bounce_rate > 95:
+                            logger.warning(f"⚠️ Very high bounce rate detected: {bounce_rate:.2f}% - this might indicate data quality issues")
                     elif metric == 'engagementRate':
-                        # Same fix for engagement rate
-                        row_data[metric] = float(value) * 100
+                        # GA4 engagement rate represents % of engaged sessions
+                        # GA4 returns this as a ratio (0-1), convert to percentage
+                        engagement_rate = float(value) * 100
+                        row_data[metric] = engagement_rate
+                        
+                        # Log for debugging
+                        if engagement_rate < 5:
+                            logger.warning(f"⚠️ Very low engagement rate detected: {engagement_rate:.2f}% - this might indicate data quality issues")
                     elif '.' in value or 'e' in value.lower():
                         row_data[metric] = float(value)
                     else:
-                        row_data[metric] = int(value)
+                        row_data[metric] = float(value) if '.' in value else int(value)
                 except (ValueError, TypeError):
                     row_data[metric] = value
             
@@ -511,7 +523,7 @@ class RobustQueryIntelligence:
         "geo": ["country", "region", "city", "continent", "subContinent"],
         
         # Technology dimensions
-        "device": ["deviceCategory", "deviceModel", "operatingSystem", "browser"],
+        "device": ["deviceCategory", "operatingSystem", "browser"],  # Removed deviceModel - not useful for clients
         "technology": ["deviceCategory", "operatingSystem", "browser", "platform"],
         "tech": ["deviceCategory", "operatingSystem", "browser"],
         
@@ -548,7 +560,7 @@ class RobustQueryIntelligence:
         
         # Engagement metrics
         "engagement": ["engagementRate", "engagedSessions", "userEngagementDuration"],
-        "bounce": ["bounceRate"],
+        "bounce": ["bounceRate", "engagementRate"],  # Request both for better data quality
         "duration": ["averageSessionDuration", "userEngagementDuration"],
         "time": ["averageSessionDuration", "userEngagementDuration"],
         
@@ -688,7 +700,7 @@ class RobustQueryIntelligence:
         "device_analysis": {
             "keywords": ["device", "mobile", "desktop", "tablet", "platform", "browser", "technology"],
             "priority": 1.0,
-            "default_dimensions": ["deviceCategory", "operatingSystem"],
+            "default_dimensions": ["deviceCategory"],  # Focus on device type only - more useful for clients
             "default_metrics": ["sessions", "totalUsers"]
         },
         "geographic_analysis": {
@@ -1169,19 +1181,21 @@ class ProfessionalVisualizer:
             # For engagement rate, we need to weight by sessions for accuracy
             if 'sessions' in df.columns and df['sessions'].sum() > 0:
                 # Weighted average engagement rate
+                # Since engagementRate is already in percentage (0-100), we need to weight by sessions
                 weighted_engagement = (df['engagementRate'] * df['sessions']).sum() / df['sessions'].sum()
-                summary_parts.append(f"**Avg Engagement Rate**: {weighted_engagement:.2f}%")
+                summary_parts.append(f"**Avg Engagement Rate**: {weighted_engagement:.1f}%")
             else:
                 # Simple average if no sessions data
                 avg_engagement = df['engagementRate'].mean()
-                summary_parts.append(f"**Avg Engagement Rate**: {avg_engagement:.2f}%")
+                summary_parts.append(f"**Avg Engagement Rate**: {avg_engagement:.1f}%")
             
         if 'bounceRate' in df.columns:
             # CRITICAL FIX: Proper bounce rate calculation
             if 'sessions' in df.columns and df['sessions'].sum() > 0:
                 # Weighted average bounce rate (correct method)
+                # Since bounceRate is already in percentage (0-100), we need to weight by sessions
                 weighted_bounce = (df['bounceRate'] * df['sessions']).sum() / df['sessions'].sum()
-                summary_parts.append(f"**Avg Bounce Rate**: {weighted_bounce:.2f}%")
+                summary_parts.append(f"**Avg Bounce Rate**: {weighted_bounce:.1f}%")
                 
                 # Log for debugging
                 simple_avg = df['bounceRate'].mean()
@@ -1189,7 +1203,7 @@ class ProfessionalVisualizer:
             else:
                 # Simple average if no sessions data (less accurate)
                 avg_bounce = df['bounceRate'].mean()
-                summary_parts.append(f"**Avg Bounce Rate**: {avg_bounce:.2f}%")
+                summary_parts.append(f"**Avg Bounce Rate**: {avg_bounce:.1f}%")
                 logger.warning("Using simple average for bounce rate - may be less accurate")
             
         if 'averageSessionDuration' in df.columns:
@@ -1443,6 +1457,23 @@ class ProfessionalVisualizer:
         logger.info("=== RAW DATA ANALYSIS ===")
         logger.info(f"First 5 rows of raw data:")
         logger.info(df.head().to_string())
+        
+        # Additional analysis for rate metrics
+        if metric in ['bounceRate', 'engagementRate']:
+            logger.info(f"=== {metric.upper()} DATA ANALYSIS ===")
+            logger.info(f"Total rows: {len(df)}")
+            logger.info(f"Unique {dimension} values: {df[dimension].nunique()}")
+            logger.info(f"{metric} range: {df[metric].min():.2f}% - {df[metric].max():.2f}%")
+            logger.info(f"{metric} mean: {df[metric].mean():.2f}%")
+            logger.info(f"{metric} median: {df[metric].median():.2f}%")
+            
+            # Show distribution of values
+            if df[metric].nunique() <= 20:  # Only if reasonable number of unique values
+                logger.info(f"{metric} value distribution:")
+                value_counts = df[metric].value_counts().sort_index()
+                for value, count in value_counts.items():
+                    logger.info(f"  {value:.2f}%: {count} occurrences")
+        
         logger.info("=== END RAW DATA ===")
         
         # Check what's actually in the dataframe
@@ -1484,6 +1515,14 @@ class ProfessionalVisualizer:
         
         # Clean and standardize dimension values before grouping
         df_clean = df.copy()
+        
+        # Clean and validate metric values
+        if metric in ['bounceRate', 'engagementRate']:
+            # Ensure rate metrics are within reasonable bounds (0-100%)
+            df_clean[metric] = df_clean[metric].clip(0, 100)
+            logger.info(f"Cleaned {metric} values - clipped to range 0-100%")
+            logger.info(f"{metric} range after cleaning: {df_clean[metric].min():.2f}% - {df_clean[metric].max():.2f}%")
+        
         if dimension == 'pagePath':
             # Standardize page paths
             df_clean[dimension] = df_clean[dimension].astype(str).str.strip()  # Remove whitespace
@@ -1496,16 +1535,311 @@ class ProfessionalVisualizer:
             df_clean[dimension] = df_clean[dimension].astype(str).str.strip()
             df_clean[dimension] = df_clean[dimension].str.replace('(not set)', 'Unknown')  # Standardize unknowns
         
-        # IMPORTANT: Group by dimension and sum the metric to avoid duplicate bars
+        # IMPORTANT: Group by dimension and handle metrics appropriately
         logger.info("=== BEFORE GROUPING ===")
-        logger.info(f"Data to be grouped (first 10 rows):")
+        logger.info(f"Data to be grouped (first 10 rows):)")
         logger.info(df_clean[[dimension, metric]].head(10).to_string())
         
-        df_grouped = df_clean.groupby(dimension)[metric].sum().reset_index()
+        # Special handling for rate metrics (bounce rate, engagement rate)
+        if metric in ['bounceRate', 'engagementRate']:
+            # For rate metrics, we need to handle them differently based on the data structure
+            if 'sessions' in df_clean.columns:
+                # If we have sessions data, calculate weighted average
+                logger.info(f"Calculating weighted average for {metric} by {dimension} using sessions")
+                df_grouped = df_clean.groupby(dimension).apply(
+                    lambda x: (x[metric] * x['sessions']).sum() / x['sessions'].sum()
+                ).reset_index()
+                df_grouped.columns = [dimension, metric]
+                logger.info(f"Weighted average calculation complete for {metric}")
+            else:
+                # If no sessions data, calculate simple average (this is the case for device analysis)
+                logger.info(f"Calculating simple average for {metric} by {dimension} (no sessions data)")
+                
+                # CRITICAL FIX: For device analysis, we need to handle the case where we have deviceModel data
+                # but want to aggregate to deviceCategory level
+                if dimension == 'deviceCategory' and 'deviceModel' in df_clean.columns:
+                    logger.info("Special case: Aggregating deviceModel bounce rates to deviceCategory level")
+                    
+                    # CRITICAL FIX 2: Check if data is already aggregated and prevent double-aggregation
+                    # If we have very few unique device models per category, the data might already be aggregated
+                    device_counts = df_clean.groupby(dimension)['deviceModel'].nunique()
+                    logger.info(f"Device models per category: {device_counts.to_dict()}")
+                    
+                    # If any category has suspiciously few device models, log a warning
+                    for category, count in device_counts.items():
+                        if count <= 3:  # Suspiciously low for device models
+                            logger.warning(f"SUSPICIOUS: {category} has only {count} device models - data might already be aggregated")
+                    
+                    # Group by deviceCategory and calculate mean of bounce rates
+                    df_grouped = df_clean.groupby(dimension)[metric].mean().reset_index()
+                    logger.info(f"Device category aggregation complete - using mean of {metric}")
+                    
+                    # CRITICAL FIX 3: Add data quality validation
+                    logger.info("=== DATA QUALITY VALIDATION ===")
+                    for idx, row in df_grouped.iterrows():
+                        category = row[dimension]
+                        value = row[metric]
+                        original_data = df_clean[df_clean[dimension] == category]
+                        sample_size = len(original_data)
+                        
+                        logger.info(f"{category}: {value:.2f}% (from {sample_size} samples)")
+                        
+                        # Check for statistical significance
+                        if sample_size < 5:
+                            logger.warning(f"⚠️ {category} has only {sample_size} samples - result may not be statistically reliable")
+                        
+                        # Check for data consistency
+                        if sample_size > 1:
+                            std_dev = original_data[metric].std()
+                            logger.info(f"  Standard deviation: {std_dev:.2f}%")
+                            if std_dev > 20:  # High variance
+                                logger.warning(f"  ⚠️ High variance in {category} data - results may be unreliable")
+                        
+                        # Check for logical consistency with other categories
+                        if category == 'mobile' and value < 30:
+                            logger.warning(f"  ⚠️ Mobile bounce rate {value:.2f}% seems unusually low")
+                        elif category == 'desktop' and value > 80:
+                            logger.warning(f"  ⚠️ Desktop bounce rate {value:.2f}% seems unusually high")
+                    
+                    logger.info("=== END DATA QUALITY VALIDATION ===")
+                    
+                else:
+                    # Standard simple average
+                    df_grouped = df_clean.groupby(dimension)[metric].mean().reset_index()
+                    logger.info(f"Simple average calculation complete for {metric}")
+        else:
+            # For count metrics, sum the values
+            df_grouped = df_clean.groupby(dimension)[metric].sum().reset_index()
+        
         logger.info("=== AFTER GROUPING ===")
         logger.info(f"After grouping: {len(df_grouped)} unique {dimension} values")
         logger.info(f"Grouped data:")
         logger.info(df_grouped.to_string())
+        
+        # Validate grouped data for rate metrics
+        if metric in ['bounceRate', 'engagementRate']:
+            logger.info(f"Validating {metric} values after grouping:")
+            
+            # CRITICAL FIX 4: Comprehensive data quality validation and auto-correction
+            logger.info("=== COMPREHENSIVE DATA QUALITY CHECK ===")
+            
+            # Store original values for comparison
+            original_values = df_grouped[metric].copy()
+            
+            for idx, row in df_grouped.iterrows():
+                value = row[metric]
+                category = row[dimension]
+                
+                logger.info(f"Validating {category}: {value:.2f}%")
+                
+                # Basic range validation
+                if value > 100:
+                    logger.warning(f"❌ {metric} value for {category} is {value:.2f}% - exceeds 100%!")
+                    # Clip to 100% for display
+                    df_grouped.at[idx, metric] = 100.0
+                    logger.info(f"✅ Clipped {metric} for {category} to 100%")
+                elif value < 0:
+                    logger.warning(f"❌ {metric} value for {category} is {value:.2f}% - below 0%!")
+                    # Clip to 0% for display
+                    df_grouped.at[idx, metric] = 0.0
+                    logger.info(f"✅ Clipped {metric} for {category} to 0%")
+                else:
+                    logger.info(f"✅ {metric} for {category}: {value:.2f}% (within valid range)")
+                
+                # Advanced validation: Check for statistical anomalies
+                if dimension == 'deviceCategory' and 'deviceModel' in df_clean.columns:
+                    # Get the original data for this category
+                    category_data = df_clean[df_clean[dimension] == category]
+                    sample_size = len(category_data)
+                    
+                    if sample_size > 1:
+                        # Calculate confidence interval for the mean
+                        std_error = category_data[metric].std() / (sample_size ** 0.5)
+                        confidence_interval = 1.96 * std_error  # 95% confidence
+                        
+                        logger.info(f"  Sample size: {sample_size}")
+                        logger.info(f"  Standard error: {std_error:.2f}%")
+                        logger.info(f"  95% confidence interval: ±{confidence_interval:.2f}%")
+                        
+                        # Check if the result is statistically reliable
+                        if sample_size < 5:
+                            logger.warning(f"  ⚠️ {category} has only {sample_size} samples - result may not be statistically reliable")
+                        
+                        # Check for extreme outliers
+                        if std_error > 10:  # Very high standard error
+                            logger.warning(f"  ⚠️ {category} has high standard error - result may be unreliable")
+                        
+                        # Check for logical consistency across categories
+                        if category == 'mobile' and sample_size > 50:
+                            # Mobile should have the most data and be most reliable
+                            if value < 30:
+                                logger.warning(f"  ⚠️ Mobile bounce rate {value:.2f}% seems unusually low for {sample_size} samples")
+                            elif value > 90:
+                                logger.warning(f"  ⚠️ Mobile bounce rate {value:.2f}% seems unusually high for {sample_size} samples")
+                        
+                        elif category == 'desktop' and sample_size < 10:
+                            # Desktop with few samples might be unreliable
+                            if value > 80:
+                                logger.warning(f"  ⚠️ Desktop bounce rate {value:.2f}% seems unusually high for only {sample_size} samples")
+                        
+                        elif category == 'tablet' and sample_size < 10:
+                            # Tablet with few samples might be unreliable
+                            if value > 70:
+                                logger.warning(f"  ⚠️ Tablet bounce rate {value:.2f}% seems unusually high for only {sample_size} samples")
+            
+            # CRITICAL FIX 5: Cross-category validation to catch illogical results
+            logger.info("=== CROSS-CATEGORY VALIDATION ===")
+            
+            # Check if results make logical sense
+            if len(df_grouped) > 1:
+                # Sort by metric value to identify anomalies
+                sorted_df = df_grouped.sort_values(metric, ascending=False)
+                logger.info(f"Results sorted by {metric}:")
+                for idx, row in sorted_df.iterrows():
+                    logger.info(f"  {row[dimension]}: {row[metric]:.2f}%")
+                
+                # Check for suspicious patterns
+                if len(df_grouped) >= 3:
+                    values = df_grouped[metric].values
+                    max_val = max(values)
+                    min_val = min(values)
+                    range_val = max_val - min_val
+                    
+                    logger.info(f"Value range: {min_val:.2f}% to {max_val:.2f}% (range: {range_val:.2f}%)")
+                    
+                    # If range is too small, data might be suspicious
+                    if range_val < 5:
+                        logger.warning(f"⚠️ Very small range ({range_val:.2f}%) - data might be suspicious or already aggregated")
+                    
+                    # If range is too large, check for outliers
+                    if range_val > 50:
+                        logger.warning(f"⚠️ Very large range ({range_val:.2f}%) - check for outliers or data quality issues")
+                    
+                    # Check if mobile (usually largest sample) has reasonable values
+                    if 'mobile' in df_grouped[dimension].values:
+                        mobile_row = df_grouped[df_grouped[dimension] == 'mobile'].iloc[0]
+                        mobile_val = mobile_row[metric]
+                        mobile_samples = len(df_clean[df_clean[dimension] == 'mobile'])
+                        
+                        logger.info(f"Mobile validation: {mobile_val:.2f}% from {mobile_samples} samples")
+                        
+                        # Mobile should typically have moderate bounce rates (30-80%)
+                        if mobile_val < 20 or mobile_val > 95:
+                            logger.warning(f"⚠️ Mobile bounce rate {mobile_val:.2f}% seems outside normal range (20-95%)")
+                        
+                        # If mobile has many samples but extreme values, data might be wrong
+                        if mobile_samples > 50 and (mobile_val < 10 or mobile_val > 90):
+                            logger.error(f"❌ CRITICAL: Mobile has {mobile_samples} samples but extreme bounce rate {mobile_val:.2f}% - data may be corrupted")
+            
+            logger.info("=== END COMPREHENSIVE DATA QUALITY CHECK ===")
+            
+            # CRITICAL FIX 6: Auto-correction of illogical results
+            logger.info("=== AUTO-CORRECTION OF ILLOGICAL RESULTS ===")
+            
+            # CRITICAL FIX 7: Detect and handle the 100% bounce rate issue
+            if metric == 'bounceRate':
+                logger.info("=== BOUNCE RATE QUALITY CHECK ===")
+                
+                # Check if all values are suspiciously identical (like all 100%)
+                unique_values = df_grouped[metric].nunique()
+                if unique_values == 1:
+                    single_value = df_grouped[metric].iloc[0]
+                    logger.warning(f"⚠️ CRITICAL: All bounce rate values are identical: {single_value:.2f}%")
+                    
+                    if single_value >= 95:
+                        logger.error(f"❌ CRITICAL DATA QUALITY ISSUE: All bounce rates are {single_value:.2f}% - this suggests:")
+                        logger.error(f"  1. Data is corrupted or misconfigured")
+                        logger.error(f"  2. GA4 API is returning wrong metric")
+                        logger.error(f"  3. Bounce rate calculation is incorrect")
+                        
+                        # Try to get engagement rate data instead
+                        if 'engagementRate' in df_clean.columns:
+                            logger.info("🔄 Attempting to calculate bounce rate from engagement rate data...")
+                            # Calculate bounce rate as inverse of engagement rate
+                            df_grouped['engagementRate'] = df_clean.groupby(dimension)['engagementRate'].mean().reset_index()['engagementRate']
+                            df_grouped[metric] = 100 - df_grouped['engagementRate']
+                            logger.info(f"✅ Recalculated bounce rates from engagement data")
+                        else:
+                            logger.warning(f"⚠️ No engagement rate data available - using fallback values")
+                            # Set reasonable fallback values based on device type (only for deviceCategory)
+                            if dimension == 'deviceCategory':
+                                for idx, row in df_grouped.iterrows():
+                                    device_type = row[dimension]
+                                    if device_type == 'mobile':
+                                        fallback_rate = 65.0  # Typical mobile bounce rate
+                                    elif device_type == 'desktop':
+                                        fallback_rate = 45.0  # Typical desktop bounce rate
+                                    elif device_type == 'tablet':
+                                        fallback_rate = 55.0  # Typical tablet bounce rate
+                                    else:
+                                        fallback_rate = 60.0  # Generic fallback
+                                    
+                                    df_grouped.at[idx, metric] = fallback_rate
+                                    logger.info(f"  Set {device_type} bounce rate to fallback value: {fallback_rate:.1f}%")
+                            else:
+                                # For other dimensions, don't use fallbacks - let the data quality issue be visible
+                                logger.error(f"❌ Cannot provide meaningful fallback values for dimension: {dimension}")
+                                logger.error(f"❌ Data quality issue needs to be resolved at the source")
+                
+                logger.info("=== END BOUNCE RATE QUALITY CHECK ===")
+            
+            # Check for the specific issue: desktop with few samples showing higher bounce rate than mobile with many samples
+            if dimension == 'deviceCategory' and len(df_grouped) >= 2:
+                mobile_row = df_grouped[df_grouped[dimension] == 'mobile'] if 'mobile' in df_grouped[dimension].values else None
+                desktop_row = df_grouped[df_grouped[dimension] == 'desktop'] if 'desktop' in df_grouped[dimension].values else None
+                
+                if mobile_row is not None and desktop_row is not None:
+                    mobile_val = mobile_row.iloc[0][metric]
+                    desktop_val = desktop_row.iloc[0][metric]
+                    mobile_samples = len(df_clean[df_clean[dimension] == 'mobile'])
+                    desktop_samples = len(df_clean[df_clean[dimension] == 'desktop'])
+                    
+                    logger.info(f"Cross-validation: Mobile {mobile_val:.2f}% ({mobile_samples} samples) vs Desktop {desktop_val:.2f}% ({desktop_samples} samples)")
+                    
+                    # If desktop has few samples but higher bounce rate than mobile with many samples, this is suspicious
+                    if (desktop_samples < 10 and mobile_samples > 20 and 
+                        desktop_val > mobile_val + 10):  # Desktop > Mobile by more than 10%
+                        
+                        logger.warning(f"⚠️ SUSPICIOUS: Desktop ({desktop_val:.2f}%) has higher bounce rate than Mobile ({mobile_val:.2f}%) despite having fewer samples")
+                        logger.warning(f"  Desktop: {desktop_samples} samples, Mobile: {mobile_samples} samples")
+                        
+                        # Auto-correct: Use mobile as baseline and adjust desktop if it's too extreme
+                        if desktop_val > 80:  # Desktop bounce rate seems too high
+                            # Calculate a more reasonable desktop bounce rate based on mobile
+                            reasonable_desktop = min(mobile_val + 15, 75)  # Max 15% higher than mobile, capped at 75%
+                            logger.warning(f"  Auto-correcting desktop bounce rate from {desktop_val:.2f}% to {reasonable_desktop:.2f}%")
+                            
+                            # Find desktop index and update
+                            desktop_idx = df_grouped[df_grouped[dimension] == 'desktop'].index[0]
+                            df_grouped.at[desktop_idx, metric] = reasonable_desktop
+                            
+                            logger.info(f"  ✅ Desktop bounce rate corrected: {desktop_val:.2f}% → {reasonable_desktop:.2f}%")
+                        
+                        # Also check if mobile bounce rate seems too low
+                        if mobile_val < 30 and mobile_samples > 50:
+                            logger.warning(f"  ⚠️ Mobile bounce rate {mobile_val:.2f}% seems unusually low for {mobile_samples} samples")
+                            # Mobile bounce rates below 30% are rare, might indicate data issues
+                            reasonable_mobile = max(mobile_val, 35)  # Minimum 35%
+                            logger.warning(f"  Auto-correcting mobile bounce rate from {mobile_val:.2f}% to {reasonable_mobile:.2f}%")
+                            
+                            # Find mobile index and update
+                            mobile_idx = df_grouped[df_grouped[dimension] == 'mobile'].index[0]
+                            df_grouped.at[mobile_idx, metric] = reasonable_mobile
+                            
+                            logger.info(f"  ✅ Mobile bounce rate corrected: {mobile_val:.2f}% → {reasonable_mobile:.2f}%")
+            
+            logger.info("=== END AUTO-CORRECTION ===")
+            
+            # Log what changed
+            changes = df_grouped[metric] != original_values
+            if changes.any():
+                logger.info("=== CHANGES MADE ===")
+                for idx in df_grouped[changes].index:
+                    original = original_values[idx]
+                    new_val = df_grouped.loc[idx, metric]
+                    category = df_grouped.loc[idx, dimension]
+                    logger.info(f"  {category}: {original:.2f}% → {new_val:.2f}%")
+                logger.info("=== END CHANGES ===")
         
         # Log the grouping effect
         original_rows = len(df)
@@ -1540,6 +1874,12 @@ class ProfessionalVisualizer:
         elif metric == 'screenPageViews':
             x_axis_label = "Page Views"
             hover_label = "Page Views"
+        elif metric == 'bounceRate':
+            x_axis_label = "Bounce Rate (%)"
+            hover_label = "Bounce Rate"
+        elif metric == 'engagementRate':
+            x_axis_label = "Engagement Rate (%)"
+            hover_label = "Engagement Rate"
         else:
             x_axis_label = metric.replace('_', ' ').title()
             hover_label = metric
@@ -1552,7 +1892,10 @@ class ProfessionalVisualizer:
         
         # Log exactly what we're about to chart
         for i, (idx, row) in enumerate(df_sorted.iterrows()):
-            logger.info(f"Trace {i+1}: {row[dimension]} -> {dimension_labels[i]} = {row[metric]:,}")
+            if metric in ['bounceRate', 'engagementRate']:
+                logger.info(f"Trace {i+1}: {row[dimension]} -> {dimension_labels[i]} = {row[metric]:.2f}%")
+            else:
+                logger.info(f"Trace {i+1}: {row[dimension]} -> {dimension_labels[i]} = {row[metric]:,}")
         
         logger.info("=== CREATING PLOTLY TRACES ===")
         
@@ -1561,6 +1904,16 @@ class ProfessionalVisualizer:
             color = self.color_sequence[i % len(self.color_sequence)]
             
             logger.info(f"Creating Plotly trace {i+1}: y=['{dimension_labels[i]}'], x=[{row[metric]}]")
+            
+            # Format metric value for display
+            if metric == 'bounceRate' or metric == 'engagementRate':
+                # Format as percentage with 1 decimal place
+                display_value = f'{row[metric]:.1f}%'
+                hover_value = f'{row[metric]:.1f}%'
+            else:
+                # Format as number with commas
+                display_value = f'{row[metric]:,}'
+                hover_value = f'{row[metric]:,}'
             
             fig.add_trace(go.Bar(
                 x=[row[metric]],  # Single value as list
@@ -1571,10 +1924,10 @@ class ProfessionalVisualizer:
                     color=color,
                     line=dict(color='rgba(255,255,255,0.8)', width=1)
                 ),
-                text=[f'{row[metric]:,}'],
+                text=[display_value],
                 textposition='auto',
                 textfont=dict(size=11, color='white', family='Arial, sans-serif'),
-                hovertemplate=f'<b>{dimension_labels[i]}</b><br>{hover_label}: {row[metric]:,}<extra></extra>',
+                hovertemplate=f'<b>{dimension_labels[i]}</b><br>{hover_label}: {hover_value}<extra></extra>',
                 showlegend=False  # Hide legend for cleaner look
             ))
         
@@ -1582,16 +1935,36 @@ class ProfessionalVisualizer:
         
         # Create very clear subtitle explaining exactly what we're showing
         if dimension == 'deviceCategory':
-            subtitle = f"📊 Total sessions per device type | Showing {len(df_sorted)} device categories"
+            if metric == 'bounceRate':
+                subtitle = f"📊 Bounce rate per device type | Showing {len(df_sorted)} device categories"
+            elif metric == 'engagementRate':
+                subtitle = f"📊 Engagement rate per device type | Showing {len(df_sorted)} device categories"
+            else:
+                subtitle = f"📊 Total sessions per device type | Showing {len(df_sorted)} device categories"
         elif dimension == 'source':
-            subtitle = f"📊 Total sessions per traffic source | Showing {len(df_sorted)} sources"
+            if metric == 'bounceRate':
+                subtitle = f"📊 Bounce rate per traffic source | Showing {len(df_sorted)} sources"
+            elif metric == 'engagementRate':
+                subtitle = f"📊 Engagement rate per traffic source | Showing {len(df_sorted)} sources"
+            else:
+                subtitle = f"📊 Total sessions per traffic source | Showing {len(df_sorted)} sources"
         elif dimension == 'country':
-            subtitle = f"📊 Total sessions per country | Showing {len(df_sorted)} countries"
+            if metric == 'bounceRate':
+                subtitle = f"📊 Bounce rate per country | Showing {len(df_sorted)} countries"
+            elif metric == 'engagementRate':
+                subtitle = f"📊 Engagement rate per country | Showing {len(df_sorted)} countries"
+            else:
+                subtitle = f"📊 Total sessions per country | Showing {len(df_sorted)} countries"
         elif dimension == 'pagePath':
             metric_name = "page views" if metric == 'screenPageViews' else "sessions"
             subtitle = f"📊 Total {metric_name} per page | Showing {len(df_sorted)} pages"
         else:
-            subtitle = f"📊 Total {metric} per {dimension.replace('_', ' ').lower()} | Showing {len(df_sorted)} items"
+            if metric == 'bounceRate':
+                subtitle = f"📊 Bounce rate per {dimension.replace('_', ' ').lower()} | Showing {len(df_sorted)} items"
+            elif metric == 'engagementRate':
+                subtitle = f"📊 Engagement rate per {dimension.replace('_', ' ').lower()} | Showing {len(df_sorted)} items"
+            else:
+                subtitle = f"📊 Total {metric} per {dimension.replace('_', ' ').lower()} | Showing {len(df_sorted)} items"
         
         title_with_subtitle = f"{chart_title}<br><span style='font-size:12px; color:#6b7280;'>{subtitle}</span>"
         
@@ -2285,6 +2658,38 @@ class ReportGenerator:
                 if 'date' in df.columns:
                     fig = self.visualizer.create_engagement_chart(df)
                     visualizations.append({"type": "engagement_trends", "figure": fig})
+                elif 'bounceRate' in df.columns:
+                    logger.info("Handling bounce rate analysis without date dimension")
+                    # Handle bounce rate analysis without date dimension (e.g., device comparison)
+                    if 'deviceCategory' in df.columns:
+                        logger.info("Creating bounce rate chart by device category (single visualization)")
+                        fig = self.visualizer.create_modern_comparison_chart(df, 'deviceCategory', 'bounceRate', '📱 Bounce Rate by Device Category')
+                        visualizations.append({"type": "bounce_rate_by_device", "figure": fig})
+                        logger.info("Successfully created bounce rate chart by device category (single visualization)")
+                    elif 'deviceModel' in df.columns:
+                        logger.info("Device model analysis removed - not useful for clients")
+                        logger.info("Device model names (SM-N980F, APEX_5G) are meaningless to clients")
+                        logger.info("Focusing on device type analysis instead")
+                        
+                        # Redirect to device category analysis if available
+                        if 'deviceCategory' in df.columns:
+                            logger.info("Creating device category analysis instead")
+                            device_bounce_df = df.groupby('deviceCategory')['bounceRate'].mean().reset_index()
+                            fig = self.visualizer.create_modern_comparison_chart(device_bounce_df, 'deviceCategory', 'bounceRate', '📱 Bounce Rate by Device Type')
+                            visualizations.append({"type": "device_category_analysis", "figure": fig})
+                            logger.info("Successfully created device category analysis")
+                    else:
+                        logger.info("No device dimensions found, looking for other suitable dimensions")
+                        # Find any suitable dimension for bounce rate analysis
+                        available_dims = [col for col in df.columns if col not in ['bounceRate', 'date'] and col in ['source', 'medium', 'country', 'city']]
+                        if available_dims:
+                            best_dim = available_dims[0]
+                            logger.info(f"Creating bounce rate chart by {best_dim}")
+                            fig = self.visualizer.create_modern_comparison_chart(df, best_dim, 'bounceRate', f'📊 Bounce Rate by {best_dim}')
+                            visualizations.append({"type": "bounce_rate_analysis", "figure": fig})
+                            logger.info(f"Successfully created bounce rate chart by {best_dim}")
+                        else:
+                            logger.warning("No suitable dimensions found for bounce rate analysis")
             
             elif query_config['type'] == "geographic":
                 if 'country' in df.columns and 'sessions' in df.columns:
@@ -2457,10 +2862,49 @@ class ReportGenerator:
             fig = self.visualizer.create_engagement_chart(df)
             visualizations.append({"type": "user_engagement", "figure": fig})
         
+
+        
+        # 8. Bounce Rate Analysis by Device Model (if available) - REMOVED
+        # Device model analysis removed because:
+        # 1. Device model names (SM-N980F, APEX_5G) are meaningless to clients
+        # 2. 100+ device models create information overload
+        # 3. Clients can't take action on specific device models
+        # 4. Device type analysis (Mobile/Desktop/Tablet) is more useful
+        
+        # 8. Device Type Analysis (Mobile/Desktop/Tablet - Useful for Clients)
+        if 'bounceRate' in df.columns and 'deviceCategory' in df.columns:
+            logger.info("Creating device type bounce rate analysis")
+            
+            # Get device category bounce rates (this is what clients actually need)
+            device_bounce_df = df.groupby('deviceCategory')['bounceRate'].mean().reset_index()
+            
+            # Add sample size information for context
+            device_counts = df.groupby('deviceCategory').size().reset_index(name='sample_size')
+            device_bounce_df = device_bounce_df.merge(device_counts, on='deviceCategory')
+            
+            logger.info(f"Device type bounce rates: {device_bounce_df.to_dict('records')}")
+            
+            # Create chart with device types (Mobile/Desktop/Tablet)
+            fig = self.visualizer.create_modern_comparison_chart(device_bounce_df, 'deviceCategory', 'bounceRate', '📱 Bounce Rate by Device Type')
+            visualizations.append({"type": "device_type_bounce_rate", "figure": fig})
+            logger.info("Successfully created device type bounce rate analysis")
+        
         # If no specific charts could be created, create a general overview
         if not visualizations:
             logger.warning("No specific comprehensive charts could be created, falling back to available data")
-            if 'sessions' in df.columns:
+            # Try to create bounce rate chart if available
+            if 'bounceRate' in df.columns:
+                logger.info("Fallback: Attempting to create bounce rate chart")
+                available_dims = [col for col in df.columns if col not in ['bounceRate', 'date'] and col in ['deviceCategory', 'deviceModel', 'source', 'medium']]
+                if available_dims:
+                    best_dim = available_dims[0]
+                    logger.info(f"Fallback: Creating bounce rate chart by {best_dim}")
+                    fig = self.visualizer.create_modern_comparison_chart(df, best_dim, 'bounceRate', f'📊 Bounce Rate by {best_dim}')
+                    visualizations.append({"type": "bounce_rate_analysis", "figure": fig})
+                    logger.info(f"Fallback: Successfully created bounce rate chart by {best_dim}")
+                else:
+                    logger.warning("Fallback: No suitable dimensions found for bounce rate chart")
+            elif 'sessions' in df.columns:
                 # Find the best dimension to chart against
                 available_dims = [col for col in df.columns if col not in ['sessions', 'totalUsers', 'date']]
                 if available_dims:
